@@ -28,7 +28,6 @@ use proc_macro_hack::proc_macro_hack;
 #[proc_macro_hack]
 pub use vk_shader_macros_impl::include_glsl;
 
-
 /// Compile inline GLSL source into a binary SPIR-V constant
 ///
 /// ```
@@ -65,5 +64,6 @@ mod tests {
     use super::*;
 
     #[allow(dead_code)]
-    const TEST: &[u32] = include_glsl!("example.vert", version: 450, optimize: size, target: vulkan1_1);
+    const TEST: &[u32] =
+        include_glsl!("example.vert", version: 450, optimize: size, target: vulkan1_1);
 }

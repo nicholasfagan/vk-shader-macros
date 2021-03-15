@@ -1,0 +1,8 @@
+error: unknown shader compile argument
+See `https://docs.rs/vk-shader-macros/0.2.6' for help
+ --> $DIR/unknown-arg.rs:3:50
+  |
+3 | const VERTEX: &[u32] = include_glsl!(r##"src"##, bad_arg: arg);
+  |                                                  ^^^^^^^
+  |
+  = note: this error originates in a macro (in Nightly builds, run with -Z macro-backtrace for more info)

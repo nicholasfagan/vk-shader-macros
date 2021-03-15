@@ -1,0 +1,16 @@
+error: compilation error:
+<inline#0 bytes(82..163)>:4: error: 'nonsense' : undeclared identifier
+
+ --> $DIR/shader-err.rs:3:46
+  |
+3 |   const SHADER: &'static [u32] = compile_glsl!(r##"
+  |  ______________________________________________^
+4 | | #version 450
+5 | | void main() {
+6 | |     nonsense;
+7 | |     gl_Position = vec4(0,0,0,0);
+8 | | }
+9 | | "##, kind: vert);
+  | |___^
+  |
+  = note: this error originates in a macro (in Nightly builds, run with -Z macro-backtrace for more info)

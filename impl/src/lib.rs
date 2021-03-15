@@ -13,7 +13,7 @@ use syn::parse::{Parse, ParseStream, Result};
 use syn::{parse_macro_input, Ident, LitInt, LitStr, Token};
 
 fn parse_and_compile<T: Parse + Source>(tokens: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(tokens as Arguments<T>);
+    let args = parse_macro_input!(tokens with Arguments<T>::parse_with_usage_err);
     let CompiledGlsl {
         dependencies,
         spirv_words,
@@ -51,7 +51,8 @@ struct PathSource(pub LitStr);
 
 impl Parse for PathSource {
     fn parse(input: ParseStream) -> Result<Self> {
-        Ok(PathSource(input.parse::<LitStr>()?))
+        Ok(PathSource(input.parse::<LitStr>()
+            .map_err(|e| syn::Error::new(e.span(), "expected path to shader source as literal string"))?))
     }
 }
 
@@ -59,7 +60,8 @@ struct InlineSource(pub LitStr);
 
 impl Parse for InlineSource {
     fn parse(input: ParseStream) -> Result<Self> {
-        Ok(InlineSource(input.parse::<LitStr>()?))
+        Ok(InlineSource(input.parse::<LitStr>()
+            .map_err(|e| syn::Error::new(e.span(), "expected inline shader source as literal string"))?))
     }
 }
 
@@ -103,6 +105,16 @@ struct Arguments<S> {
     define: HashMap<String, Option<String>>,
     optimize: Option<shaderc::OptimizationLevel>,
     target: Option<u32>,
+}
+
+const USAGE_STR: &str = concat!("See `https://docs.rs/vk-shader-macros/", env!("CARGO_PKG_VERSION"), "' for help");
+
+impl<S: Parse> Arguments<S> {
+    pub fn parse_with_usage_err(input: ParseStream) -> Result<Self> {
+        Self::parse(input).map_err(|e| {
+           syn::Error::new(e.span(), format!("{}\n{}", e, USAGE_STR))
+        })
+    }
 }
 
 impl<S: Parse> Parse for Arguments<S> {

@@ -1,0 +1,8 @@
+error: expected path to shader source as literal string
+See `https://docs.rs/vk-shader-macros/0.2.6' for help
+ --> $DIR/empty.rs:5:32
+  |
+5 | const SPIR_V: &'static [u32] = include_glsl!();
+  |                                ^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in a macro (in Nightly builds, run with -Z macro-backtrace for more info)

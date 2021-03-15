@@ -5,273 +5,251 @@ use std::path::Path;
 use std::{env, fs, mem, str};
 
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use proc_macro_hack::proc_macro_hack;
 use quote::quote;
+use std::collections::HashMap;
 use syn::parse::{Parse, ParseStream, Result};
 use syn::{parse_macro_input, Ident, LitInt, LitStr, Token};
 
-struct IncludeGlsl {
-    sources: Vec<String>,
-    spv: Vec<u32>,
-}
-
-impl Parse for IncludeGlsl {
-    fn parse(input: ParseStream) -> Result<Self> {
-        let path_lit = input.parse::<LitStr>()?;
-        let path = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join(&path_lit.value());
-        let path_str = path.to_string_lossy();
-
-        let sources = RefCell::new(vec![path_str.clone().into_owned()]);
-        let mut options = shaderc::CompileOptions::new().unwrap();
-        options.set_include_callback(|name, ty, src, _depth| {
-            let path = match ty {
-                shaderc::IncludeType::Relative => Path::new(src).parent().unwrap().join(name),
-                shaderc::IncludeType::Standard => {
-                    Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join(name)
-                }
-            };
-            let path_str = path.to_str().ok_or("non-unicode path")?.to_owned();
-            sources.borrow_mut().push(path_str.clone());
-            Ok(shaderc::ResolvedInclude {
-                resolved_name: path_str,
-                content: fs::read_to_string(path).map_err(|x| x.to_string())?,
-            })
-        });
-
-        let mut kind = None;
-        let mut debug = !cfg!(feature = "strip");
-        let mut optimization = if cfg!(feature = "default-optimize-zero") {
-            shaderc::OptimizationLevel::Zero
-        } else {
-            shaderc::OptimizationLevel::Performance
-        };
-
-        let mut target_version = 1 << 22;
-
-        while !input.is_empty() {
-            input.parse::<Token![,]>()?;
-            let key = input.parse::<Ident>()?;
-            match &key.to_string()[..] {
-                "kind" => {
-                    input.parse::<Token![:]>()?;
-                    let value = input.parse::<Ident>()?;
-                    if let Some(x) = extension_kind(&value.to_string()) {
-                        kind = Some(x);
-                    } else {
-                        return Err(syn::Error::new(value.span(), "unknown shader kind"));
-                    }
-                }
-                "version" => {
-                    input.parse::<Token![:]>()?;
-                    let x = input.parse::<LitInt>()?;
-                    options.set_forced_version_profile(
-                        x.base10_parse::<u32>()?,
-                        shaderc::GlslProfile::None,
-                    );
-                }
-                "strip" => {
-                    debug = false;
-                }
-                "debug" => {
-                    debug = true;
-                }
-                "define" => {
-                    input.parse::<Token![:]>()?;
-                    let name = input.parse::<Ident>()?;
-                    let value = if input.peek(Token![,]) {
-                        None
-                    } else {
-                        Some(input.parse::<LitStr>()?.value())
-                    };
-
-                    options.add_macro_definition(&name.to_string(), value.as_ref().map(|x| &x[..]));
-                }
-                "optimize" => {
-                    input.parse::<Token![:]>()?;
-                    let value = input.parse::<Ident>()?;
-                    if let Some(x) = optimization_level(&value.to_string()) {
-                        optimization = x;
-                    } else {
-                        return Err(syn::Error::new(value.span(), "unknown optimization level"));
-                    }
-                }
-                "target" => {
-                    input.parse::<Token![:]>()?;
-                    let value = input.parse::<Ident>()?;
-                    if let Some(version) = target(&value.to_string()) {
-                        target_version = version;
-                    } else {
-                        return Err(syn::Error::new(value.span(), "unknown target"));
-                    }
-                }
-                _ => {
-                    return Err(syn::Error::new(key.span(), "unknown shader compile option"));
-                }
-            }
+fn parse_and_compile<T: Parse + Source>(tokens: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(tokens as Arguments<T>);
+    let CompiledGlsl {
+        dependencies,
+        spirv_words,
+    } = match compile(args) {
+        Ok(x) => x,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let expanded = quote! {
+        {
+            #({ const _FORCE_DEP: &[u8] = include_bytes!(#dependencies); })*
+            &[#(#spirv_words),*]
         }
-
-        if debug {
-            options.set_generate_debug_info();
-        }
-
-        options.set_optimization_level(optimization);
-        options.set_target_env(shaderc::TargetEnv::Vulkan, target_version);
-
-        let kind = kind
-            .or_else(|| {
-                path.extension()
-                    .and_then(|x| x.to_str().and_then(|x| extension_kind(x)))
-            })
-            .unwrap_or(shaderc::ShaderKind::InferFromSource);
-        let src = fs::read_to_string(&path).map_err(|e| syn::Error::new(path_lit.span(), e))?;
-
-        let mut compiler = shaderc::Compiler::new().unwrap();
-        let out = compiler
-            .compile_into_spirv(&src, kind, &path_str, "main", Some(&options))
-            .map_err(|e| syn::Error::new(path_lit.span(), e))?;
-        if out.get_num_warnings() != 0 {
-            return Err(syn::Error::new(path_lit.span(), out.get_warning_messages()));
-        }
-        mem::drop(options);
-
-        Ok(Self {
-            sources: sources.into_inner(),
-            spv: out.as_binary().into(),
-        })
-    }
+    };
+    TokenStream::from(expanded)
 }
 
 #[proc_macro_hack]
 pub fn include_glsl(tokens: TokenStream) -> TokenStream {
-    let IncludeGlsl { sources, spv } = parse_macro_input!(tokens as IncludeGlsl);
-    let expanded = quote! {
-        {
-            #({ const _FORCE_DEP: &[u8] = include_bytes!(#sources); })*
-            &[#(#spv),*]
-        }
-    };
-    TokenStream::from(expanded)
+    parse_and_compile::<PathSource>(tokens)
 }
 
-struct CompileGlsl {
-    spv: Vec<u32>,
+#[proc_macro_hack]
+pub fn compile_glsl(tokens: TokenStream) -> TokenStream {
+    parse_and_compile::<InlineSource>(tokens)
 }
 
-impl Parse for CompileGlsl {
+trait Source {
+    fn span(&self) -> Span;
+    fn source(&self) -> syn::Result<String>;
+    fn path(&self) -> Option<String>;
+    fn name(&self) -> String;
+}
+
+struct PathSource(pub LitStr);
+
+impl Parse for PathSource {
     fn parse(input: ParseStream) -> Result<Self> {
-        let source_lit = input.parse::<LitStr>()?;
+        Ok(PathSource(input.parse::<LitStr>()?))
+    }
+}
 
-        let mut options = shaderc::CompileOptions::new().unwrap();
+struct InlineSource(pub LitStr);
 
-        let mut kind = None;
-        let mut debug = !cfg!(feature = "strip");
-        let mut optimization = if cfg!(feature = "default-optimize-zero") {
-            shaderc::OptimizationLevel::Zero
-        } else {
-            shaderc::OptimizationLevel::Performance
+impl Parse for InlineSource {
+    fn parse(input: ParseStream) -> Result<Self> {
+        Ok(InlineSource(input.parse::<LitStr>()?))
+    }
+}
+
+impl Source for PathSource {
+    fn span(&self) -> Span {
+        self.0.span()
+    }
+    fn source(&self) -> syn::Result<String> {
+        fs::read_to_string(&self.0.value()).map_err(|e| syn::Error::new(self.span(), e))
+    }
+    fn path(&self) -> Option<String> {
+        let path = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join(&self.0.value());
+        let path_str = path.to_string_lossy().to_string();
+        Some(path_str)
+    }
+    fn name(&self) -> String {
+        self.0.value()
+    }
+}
+
+impl Source for InlineSource {
+    fn span(&self) -> Span {
+        self.0.span()
+    }
+    fn source(&self) -> syn::Result<String> {
+        Ok(self.0.value())
+    }
+    fn path(&self) -> Option<String> {
+        None
+    }
+    fn name(&self) -> String {
+        format!("<inline{:?}>", self.span())
+    }
+}
+
+struct Arguments<S> {
+    source: S,
+    kind: Option<shaderc::ShaderKind>,
+    version: Option<u32>,
+    debug: Option<bool>,
+    define: HashMap<String, Option<String>>,
+    optimize: Option<shaderc::OptimizationLevel>,
+    target: Option<u32>,
+}
+
+impl<S: Parse> Parse for Arguments<S> {
+    fn parse(input: ParseStream) -> Result<Self> {
+        let mut args = Arguments {
+            source: input.parse::<S>()?,
+            kind: None,
+            version: None,
+            debug: None,
+            define: HashMap::new(),
+            optimize: None,
+            target: None,
         };
-
-        let mut target_version = 1 << 22;
 
         while !input.is_empty() {
             input.parse::<Token![,]>()?;
             let key = input.parse::<Ident>()?;
-            match &key.to_string()[..] {
+            match key.to_string().as_str() {
                 "kind" => {
                     input.parse::<Token![:]>()?;
                     let value = input.parse::<Ident>()?;
-                    if let Some(x) = extension_kind(&value.to_string()) {
-                        kind = Some(x);
-                    } else {
-                        return Err(syn::Error::new(value.span(), "unknown shader kind"));
-                    }
+                    args.kind = Some(
+                        extension_kind(&value.to_string())
+                            .ok_or_else(|| syn::Error::new(value.span(), "unknown shader kind"))?,
+                    );
                 }
                 "version" => {
                     input.parse::<Token![:]>()?;
-                    let x = input.parse::<LitInt>()?;
-                    options.set_forced_version_profile(
-                        x.base10_parse::<u32>()?,
-                        shaderc::GlslProfile::None,
-                    );
+                    args.version = Some(input.parse::<LitInt>()?.base10_parse()?);
                 }
-                "strip" => {
-                    debug = false;
-                }
-                "debug" => {
-                    debug = true;
-                }
+                "strip" => args.debug = Some(false),
+                "debug" => args.debug = Some(true),
                 "define" => {
                     input.parse::<Token![:]>()?;
-                    let name = input.parse::<Ident>()?;
+                    let name = input.parse::<Ident>()?.to_string();
                     let value = if input.peek(Token![,]) {
                         None
                     } else {
                         Some(input.parse::<LitStr>()?.value())
                     };
-
-                    options.add_macro_definition(&name.to_string(), value.as_ref().map(|x| &x[..]));
+                    args.define.insert(name, value);
                 }
                 "optimize" => {
                     input.parse::<Token![:]>()?;
                     let value = input.parse::<Ident>()?;
-                    if let Some(x) = optimization_level(&value.to_string()) {
-                        optimization = x;
-                    } else {
-                        return Err(syn::Error::new(value.span(), "unknown optimization level"));
-                    }
+                    args.optimize =
+                        Some(optimization_level(&value.to_string()).ok_or_else(|| {
+                            syn::Error::new(value.span(), "unknown optimization level")
+                        })?);
                 }
                 "target" => {
                     input.parse::<Token![:]>()?;
                     let value = input.parse::<Ident>()?;
-                    if let Some(version) = target(&value.to_string()) {
-                        target_version = version;
-                    } else {
-                        return Err(syn::Error::new(value.span(), "unknown target"));
-                    }
+                    args.target = Some(
+                        target(&value.to_string())
+                            .ok_or_else(|| syn::Error::new(value.span(), "unknown target"))?,
+                    );
                 }
                 _ => {
-                    return Err(syn::Error::new(key.span(), "unknown shader compile option"));
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "unknown shader compile argument",
+                    ))
                 }
             }
         }
-
-        if debug {
-            options.set_generate_debug_info();
-        }
-
-        options.set_optimization_level(optimization);
-        options.set_target_env(shaderc::TargetEnv::Vulkan, target_version);
-
-        let kind = kind
-            .unwrap_or(shaderc::ShaderKind::InferFromSource);
-
-        let mut compiler = shaderc::Compiler::new().unwrap();
-        let out = compiler
-            .compile_into_spirv(&source_lit.value(), kind, "<inline_shader>", "main", Some(&options))
-            .map_err(|e| syn::Error::new(source_lit.span(), e))?;
-        if out.get_num_warnings() != 0 {
-            return Err(syn::Error::new(source_lit.span(), out.get_warning_messages()));
-        }
-        mem::drop(options);
-
-        Ok(Self {
-            spv: out.as_binary().into(),
-        })
+        Ok(args)
     }
 }
 
-
-#[proc_macro_hack]
-pub fn compile_glsl(tokens: TokenStream) -> TokenStream {
-    let CompileGlsl { spv } = parse_macro_input!(tokens as CompileGlsl);
-    let expanded = quote! {
-        {
-            &[#(#spv),*]
-        }
-    };
-    TokenStream::from(expanded)
+struct CompiledGlsl {
+    dependencies: Vec<String>,
+    spirv_words: Vec<u32>,
 }
 
+fn compile<S: Source>(args: Arguments<S>) -> syn::Result<CompiledGlsl> {
+    let dependencies: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    if let Some(src_path) = args.source.path() {
+        dependencies.borrow_mut().push(src_path);
+    }
+
+    let mut options = shaderc::CompileOptions::new().unwrap();
+    options.set_include_callback(|name, ty, src, _depth| {
+        let path = match ty {
+            shaderc::IncludeType::Relative => Path::new(src).parent().unwrap().join(name),
+            shaderc::IncludeType::Standard => {
+                Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join(name)
+            }
+        };
+        let path_str = path.to_str().ok_or("non-unicode path")?.to_owned();
+        dependencies.borrow_mut().push(path_str.clone());
+        Ok(shaderc::ResolvedInclude {
+            resolved_name: path_str,
+            content: fs::read_to_string(path).map_err(|x| x.to_string())?,
+        })
+    });
+
+    match args.debug {
+        Some(true) => options.set_generate_debug_info(),
+        None if !cfg!(feature = "strip") => options.set_generate_debug_info(),
+        _ => {}
+    };
+
+    options.set_optimization_level(args.optimize.unwrap_or(
+        if cfg!(feature = "default-optimize-zero") {
+            shaderc::OptimizationLevel::Zero
+        } else {
+            shaderc::OptimizationLevel::Performance
+        },
+    ));
+    options.set_target_env(shaderc::TargetEnv::Vulkan, args.target.unwrap_or(1 << 22));
+
+    let kind = args
+        .kind
+        .or_else(|| {
+            args.source.path().map(|path| {
+                Path::new(&path)
+                    .extension()
+                    .and_then(|x| x.to_str().and_then(|x| extension_kind(x)))
+                    .unwrap_or(shaderc::ShaderKind::InferFromSource)
+            })
+        })
+        .unwrap_or(shaderc::ShaderKind::InferFromSource);
+
+    if let Some(version) = args.version {
+        options.set_forced_version_profile(version, shaderc::GlslProfile::None);
+    }
+
+    let src = args.source.source()?;
+
+    let mut compiler = shaderc::Compiler::new().unwrap();
+    let out = compiler
+        .compile_into_spirv(&src, kind, &args.source.name(), "main", Some(&options))
+        .map_err(|e| syn::Error::new(args.source.span(), e))?;
+    if out.get_num_warnings() != 0 {
+        return Err(syn::Error::new(
+            args.source.span(),
+            out.get_warning_messages(),
+        ));
+    }
+    mem::drop(options);
+
+    Ok(CompiledGlsl {
+        dependencies: dependencies.into_inner(),
+        spirv_words: out.as_binary().into(),
+    })
+}
 fn extension_kind(ext: &str) -> Option<shaderc::ShaderKind> {
     use shaderc::ShaderKind::*;
     Some(match ext {

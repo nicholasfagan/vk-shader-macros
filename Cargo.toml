@@ -23,3 +23,6 @@ vk-shader-macros-impl = { path = "impl", version = "0.2.6" }
 proc-macro-hack = "0.5.4"
 
 [workspace]
+
+[dev-dependencies]
+trybuild = "^1.0.41"

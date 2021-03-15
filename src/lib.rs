@@ -1,3 +1,21 @@
+//! Compile GLSL source files or inline source into a binary SPIR-V constant.
+//!
+//! # Example
+//! ```
+//! #[macro_use] extern crate vk_shader_macros;
+//! const VERT: &[u32] = include_glsl!("example.vert");
+//! const FRAG: &[u32] = compile_glsl!{
+//!     r#"layout(location=0) out vec4 f_color;
+//!     void main() {
+//!         f_color = vec4(0.3, 0.2, 0.1, 1.0);
+//!     }"#,
+//!     version: 450,
+//!     kind: frag
+//! };
+//! ```
+//!
+//! See the documentation for [`include_glsl!`](macro.include_glsl.html) and [`compile_glsl!`](macro.compile_glsl.html) for a list of all accepted arguments.
+
 use proc_macro_hack::proc_macro_hack;
 
 /// Compile a GLSL source file into a binary SPIR-V constant
